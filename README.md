@@ -1,165 +1,165 @@
-# Coiled-Coil-Stabilised Cytokine Mimics
+# Replacing a Native Disulfide with a De Novo Coiled Coil to Enable Cytoplasmic Bacterial Expression of a Compact Cytokine Mimic
 
-**A computational protein-design case study: replacing a native disulfide with a de novo coiled coil so a disulfide-dependent cytokine can be manufactured in _E. coli_.**
+**Jack Archer**¹
 
-`RFdiffusion3` · `ProteinMPNN` · `Boltz-2` · `AlphaFold3` · `RF3` · `SOCKET2` · `DSSP` · `HTCondor`
+¹ University of Wisconsin–Madison
 
-> **Scope & confidentiality.** This repository documents design **reasoning, methods, and tooling** only. The target is referred to throughout as the **POI** (protein of interest); its identity, all designed sequences, campaign yields, library composition, and unpublished results are intentionally withheld. Everything here is built on public methods and public structural/mutagenesis data for the POI.
-
----
-
-## TL;DR
-
-The POI is a small, **disulfide-stabilised helical cytokine** — a validated drug scaffold, but an awkward one to produce because its fold depends on disulfide bonds that don't form in the reducing _E. coli_ cytoplasm. This project designs a **compact mimic** that reproduces the receptor-binding epitope but trades the fragile disulfide staple for a **de novo antiparallel coiled coil**, so stability comes from non-covalent packing instead of chemistry that bacteria can't do.
-
-The work is a full **design → build → test-in-silico** loop with open-source tools: diffuse the graft, design the sequence, co-fold the complex across multiple predictors, filter on coiled-coil geometry, and triage a large pool down to a short, defensible order list — treating every computational score as a hypothesis, not ground truth.
+*A computational protein-design case study — manuscript-style write-up.*
 
 ---
 
-## The problem
-
-The POI is held together by chemistry the host can't reliably reproduce:
-
-- Its fold is stapled by **native disulfide bonds**, and it is normally **glycosylated**.
-- Disulfides form in an **oxidising** compartment. The _E. coli_ cytoplasm is **reducing** — the bonds don't form dependably, so cytoplasmic expression drifts toward misfold and inclusion bodies.
-
-That's the wall between a good structure and a cheap, iterable, animal-free supply.
-
-```
-        NATIVE CAP                       COILED-COIL GRAFT
-      ┌───┐   ┌───┐                       ╲ ╱   ╱ ╲
-      │   │╌S─S╌│   │        ──graft──▶     ╳     ╳       (antiparallel
-      │   │     │   │                     ╱ ╲   ╲ ╱        knobs-into-holes)
-      └───┘     └───┘                       ▼     ▲
-   needs an oxidising                  packing, not chemistry
-     compartment                          → folds in E. coli
-   ┌─────────────────┐                ┌─────────────────┐
-   │ POI core ·★epitope│               │ POI core ·★epitope│   (epitope held fixed)
-   └─────────────────┘                └─────────────────┘
-```
-
-## The design thesis
-
-**Don't fight the chemistry — remove the dependency on it.** Replace the disulfide-stabilised cap with a de novo **antiparallel coiled coil** that fills the same structural role through knobs-into-holes packing, then clean out the now-orphaned cysteines. A fold that never needed an oxidising compartment can be built in bacteria.
-
-Coiled coils are the right stabiliser to trade in because they are **designable and predictable**: heptad-repeat sequences fold into helix bundles whose orientation, register, and interface can be specified up front and then verified directly from coordinates. It's the most characterised motif in protein design — a dependable part swapped in for a fragile covalent one.
+> ### ⚠️ Intellectual-property notice
+> To protect proprietary information, the target protein is referred to throughout only as the **protein of interest (POI)**. Its identity, native sequence, experimental structure, and the specific residue numbering of its disulfides and receptor epitope are deliberately **withheld**. This document discloses **design reasoning, methods, and tooling only** — it contains **no designed sequences, no coordinate files, no expression or assay data, no screening yields, and no library composition**. All quantitative claims are stated at the level of *method behaviour*, not campaign results. **All figures are placeholders** (`figures/figureN.png`) pending publication-quality replacements.
 
 ---
 
-## Cysteine cleanup — remove the cysteines, keep what they did
+## Abstract
 
-Deleting a disulfide is not a find-and-replace to serine: each cysteine has a structural role, and a leftover free thiol is a liability (it oxidises, cross-links, scrambles). Substitutions were chosen from sequence homology and the folding literature, not by default:
+Many therapeutically important cytokines are compact helical proteins whose fold is stabilised by native disulfide bonds. This stabilisation strategy is incompatible with cheap, scalable production in the **reducing cytoplasm of *E. coli***, where disulfides do not form reliably and expression drifts toward misfolding and inclusion bodies. Here I describe the computational design of a compact mimic of one such protein (the **POI**) in which the disulfide-dependent structural cap is replaced by a **de novo antiparallel coiled coil**, transferring the stabilising role from a covalent bond to non-covalent knobs-into-holes packing while holding the mutagenesis-validated receptor epitope fixed. The mimic was produced with an open-source design stack (RFdiffusion3 → ProteinMPNN), evaluated by multi-predictor co-folding (Boltz-2, AlphaFold3, RF3), and filtered on coiled-coil geometry (SOCKET2 knobs-into-holes analysis and DSSP junction continuity). I report the design rationale, a principled scheme for removing the native cysteines, two non-obvious geometric findings that govern whether the graft welds cleanly, and a critical evaluation of when the standard confidence metrics are and are not trustworthy for this class of interface. The result is a reproducible design-build-test-in-silico pipeline that triages large design pools into a small set of candidates for wet-lab validation.
 
-| Cysteine | Substitution | Rationale |
+---
+
+## 1. Introduction
+
+The POI is a small, disulfide-stabilised helical cytokine that signals through a receptor complex, engaging it across more than one interface — all of which a functional mimic must reproduce. It is a validated pharmacological scaffold but an awkward manufacturing target for two reasons: it is natively **glycosylated**, and its tertiary fold is stapled by **native disulfide bonds**.
+
+Disulfide bonds form in oxidising subcellular compartments. Production in the *E. coli* cytoplasm — the cheapest, fastest, most iterable expression host, and the one best suited to high-throughput design-build-test loops — is a **reducing** environment in which those bonds do not form dependably. The practical consequence is poor yield of correctly folded protein. This is the gap between an attractive structure and a supply chain that supports rapid iteration.
+
+I reasoned that the most robust way to close this gap is not to coax disulfide formation in a hostile compartment, but to **remove the dependency on disulfides entirely** by substituting an alternative, non-covalent stabilising element. Coiled coils are the natural choice: they are the most thoroughly characterised structural motif in protein design, and their stability is *specifiable in advance* — heptad-repeat sequences fold into helix bundles whose oligomeric state, orientation, register, and interface can be designed and then **verified directly from coordinates**. This makes a coiled coil a dependable structural part to trade in for a fragile covalent one.
+
+**Figure 1** summarises the design strategy.
+
+<p align="center">
+  <img src="figures/figure1_design_strategy.png" alt="Figure 1 — placeholder" width="720">
+</p>
+
+> **Figure 1 | Design strategy: replacing a native disulfide with a de novo coiled coil.** *(Placeholder — to be added.)* Left: the native POI cap, stabilised by a disulfide bond (highlighted), requires an oxidising compartment to fold. Right: the redesigned mimic, in which the disulfide-stabilised cap is replaced by a de novo antiparallel coiled coil that stabilises the fold through knobs-into-holes packing; the receptor-contact epitope (★) is held fixed. The redesigned fold has no covalent-bond requirement and is therefore compatible with the reducing *E. coli* cytoplasm.
+
+---
+
+## 2. Results
+
+### 2.1 Removal of the native cysteines with role-preserving substitutions
+
+Eliminating a disulfide is not equivalent to mutating both cysteines to serine. Each cysteine contributes to the fold beyond the covalent bond itself, and any cysteine left unpaired becomes a reactive free thiol liable to aberrant oxidation and cross-linking. Substitutions were therefore selected from sequence homology and the protein-folding literature rather than by default (**Table 1**).
+
+**Table 1 | Cysteine substitution scheme.**
+
+| Native cysteine | Substitution | Rationale |
 |---|---|---|
-| Loop cysteine | **→ Pro** | A convergent natural substitution: proline appears at this position across independent mammalian lineages and **pre-organises the adjacent loop** for a slow folding step, taking over the disulfide's structural job. |
-| Its partner | **→ Ser** | Left unpaired once the loop cysteine becomes Pro. Serine is the conservative, non-reactive fill. |
-| Graft-orphaned cysteine | **→ Ser** | Orphaned when the coiled-coil graft replaces its partner. Neutralised to serine as a first pass; a co-designed fill is the follow-up. |
+| Loop cysteine | **→ Pro** | A convergent natural substitution — proline occurs at this position across independent mammalian lineages — that pre-organises the adjacent loop for a rate-limiting folding step, assuming the disulfide's structural role. |
+| Loop-cysteine partner | **→ Ser** | Rendered unpaired once the loop cysteine becomes proline; substituted to serine as a conservative, non-reactive fill. |
+| Graft-orphaned cysteine | **→ Ser** | Left without a partner when the coiled-coil graft replaces the opposing helix; neutralised to serine as a first pass, with a co-designed substitution as follow-up. |
 
-Throughout, the **receptor-contact hotspot residues** — the positions validated by alanine-scanning mutagenesis as critical for binding — are held **byte-identical**. Everything is engineered _around_ the epitope, never through it.
+Across all designs the **receptor-contact hotspot residues** — the positions validated by alanine-scanning mutagenesis as critical for binding — were held **byte-identical**. The engineering is performed *around* the epitope, never through it.
 
----
+### 2.2 De novo coiled-coil design and structural validation
 
-## Designing the coil — verified, not assumed
+The graft is only useful if it is a *bona fide* coiled coil in the intended orientation. The coil family was built around three deliberate design choices, each verified from structure rather than assumed from design intent (**Figure 2**).
 
-The stabiliser only works if it is a **real** coiled coil in the right orientation. Three deliberate choices, each verified from structure:
+**Antiparallel topology with alternating interfacial charge.** An antiparallel two-helix bundle directs both helices back toward the POI body, so the graft *extends* the terminal helix rather than projecting away from it. Charges were alternated along the interfacial `e`/`g` heptad positions so that each strand is close to **net-neutral** — avoiding a highly charged, aggregation-prone surface — while the helix *pairing* remains electrostatically complementary. Each design was confirmed to meet this specification: near-zero per-strand net charge with favourable interfacial electrostatics.
 
-### 1. Antiparallel, alternating-charge
-An antiparallel bundle points both helices back toward the POI body, so the graft **extends the terminal helix** instead of projecting away from it. Charges are alternated along the interfacial `e`/`g` positions so each strand is close to **net-neutral** (avoiding a highly charged, aggregation-prone surface) while the _pairing_ stays electrostatically complementary. Each coil was designed to spec and then checked: near-zero net charge per strand, interface electrostatics still favourable.
+**Knobs-into-holes validation on the isolated graft.** Design intent is not evidence, so knobs-into-holes (KIH) packing was confirmed with **SOCKET2** for every candidate and, critically, on each candidate's *independent co-fold* — requiring the coiled-coil register to survive structure prediction, not merely diffusion. An important methodological subtlety governs this step: the POI's own helical core also registers as KIH, so analysing the intact complex would score the native fold as "a coil" and spuriously flatter every design. The analysis is therefore performed on the **two graft helices excised into an isolated two-chain model**, so the KIH determination is attributable to the graft alone. In practice essentially every designed coil passed this test — "is it a real coil" ceased to discriminate — which correctly relocated the decisive filter downstream, to whether the coil could be **joined to the POI cleanly**.
 
-```
-   helix 1  →                         ←  helix 2   (antiparallel)
-        a·b·c·d·e·f·g                  g·f·e·d·c·b·a
-        ▲       ▲                          ▲       ▲
-      core    core   ── a/d interface ──  core    core     knobs-into-holes
-       (a,d packing)                                       e/g carry the charges
-```
+**A standardised heptad register makes the coil a modular part.** Fixing the heptad register to a single convention converts the coil library into interchangeable cassettes: one adaptor design transfers across coils of differing length and topology because they all leave the POI on the same axis and phase. This is what makes a screening library of many coils × adaptor variants tractable to build **modularly** rather than one design at a time.
 
-### 2. Verified as a coil (SOCKET2 knobs-into-holes)
-Design intent isn't evidence. KIH packing was confirmed with **SOCKET2** on every candidate **and on its independent co-fold**, so the register has to survive prediction, not just diffusion. One catch shapes the whole QC step:
+<p align="center">
+  <img src="figures/figure2_coiledcoil_design.png" alt="Figure 2 — placeholder" width="720">
+</p>
 
-> **Method insight.** The POI's own helix bundle registers as knobs-into-holes too. Running SOCKET on the whole complex would score the native core as "a coil" and flatter every design. The fix is to **excise the two graft helices into an isolated two-chain model** and test that — so the KIH call is attributable to the graft, not the scaffold.
+> **Figure 2 | De novo coiled-coil design and validation.** *(Placeholder — to be added.)* (a) Helical-wheel representation of the antiparallel two-helix graft: core packing at the `a`/`d` positions (knobs-into-holes), interfacial charge carried at the `e`/`g` positions. (b) Alternating interfacial charge yields near-neutral individual strands with a complementary, electrostatically favourable interface. (c) Attribution control: SOCKET2 KIH analysis is run on the two graft helices excised into an isolated two-chain model, so the coiled-coil call is not confounded by the POI's own helical core.
 
-The consequence was clarifying: essentially _every_ designed coil passed the KIH test, so "is it a real coil" stopped discriminating — and the filter that mattered moved downstream, to whether the coil could be **joined to the POI cleanly**.
+### 2.3 Graft junction geometry governs whether the weld is clean
 
-### 3. A standardised register → the coil becomes a swappable part
-Locking the heptad register to one convention turns the coil library into interchangeable cassettes: a single adaptor design transfers across coils of different length and topology, because they all leave the POI on the same axis at the same phase. That's what makes a real screening library (hundreds of coils × adaptor variants) tractable to build **modularly** instead of one-off.
+Grafting is fundamentally a geometry problem. The coil must meet the POI helix through a short adaptor that ideally reads as a **single continuous α-helix**, so that the graft is rigid and the receptor epitope does not wobble. Two findings from the coordinates drove the adaptor design.
 
----
+**Junction continuity was measured, not eyeballed.** A well-formed adaptor resolves as clean α-helix or clean loop; a strained adaptor exhibits 3₁₀ / π / β signatures at the junction. Continuity was scored per design with **DSSP**. An earlier crossing-angle metric was **deprecated** after it disagreed with DSSP on the majority of designs, because it accepted welds that were collinear but internally distorted — a reminder that a geometric proxy must be reconciled against the actual secondary structure.
 
-## The junction — the hard part is the weld, not the coil
+**Motif-scaffolding silently re-docks the coil.** Coils positioned ~20 Å *away* from the POI in the input nonetheless returned as continuous chains, because the motif-scaffolding step applies a rigid-body move that pulls the coil inward to close a short linker. Adaptor **length therefore steers graft geometry**: to preserve a long, straight weld, the coil must be seeded farther out. This behaviour is non-obvious and visible only by comparing input and output coordinates.
 
-Grafting is a geometry problem. The coil must meet the POI helix through a short adaptor that ideally reads as **one continuous α-helix**, so the graft is rigid and the epitope doesn't wobble. Two findings from the coordinates drove the design:
+A deliberately unresolved question underlies these choices: **must the weld be a rigid continuous helix, or can it be flexible?** The literature indicates this is target-dependent, so rather than assume, the design was structured as an explicit test — rigid-helix, helical-linker (`EAAAK`-type), and flexible (`GGGGS`-type) adaptors on identical cores — to be resolved by assay rather than preference.
 
-- **Continuity, measured — not eyeballed.** A good adaptor resolves as clean helix or clean loop; a bad one shows strained 3₁₀ / π / strand signatures at the junction. This was scored with **DSSP** per design — and an earlier crossing-angle metric was **deprecated** once it disagreed with DSSP on most designs by passing welds that were collinear but internally distorted.
-- **The scaffolder silently re-docks the coil.** Coils placed ~20 Å _off_ the POI still came back as continuous chains — motif-scaffolding rigid-body pulls the coil inward to close a short linker. So adaptor **length steers geometry**: to keep a long straight weld, the coil has to start farther out. Non-obvious, and only visible by comparing input vs output coordinates.
+### 2.4 A reproducible design–fold–filter pipeline for pool-scale triage
 
-Underneath sits an honest open question: **must the weld be a rigid continuous helix, or can it be flexible?** The literature says target-dependent, so rather than assume, it's set up as an explicit test — rigid-helix, helical-linker (`EAAAK`), and flexible (`GGGGS`) adaptors on the same cores — to be decided by assay, not preference.
+The purpose of the tooling is triage: converting a large diffusion pool into a short, defensible list of candidates for synthesis. The pipeline is implemented as reproducible **HTCondor DAGs** with per-stage checkpointing and fan-out (scaffold → sequences → folds), so that campaigns of tens of thousands of designs are a matter of bookkeeping rather than manual effort (**Figure 3**).
+
+<p align="center">
+  <img src="figures/figure3_pipeline.png" alt="Figure 3 — placeholder" width="860">
+</p>
+
+> **Figure 3 | Design–fold–filter pipeline.** *(Placeholder — to be added.)* (1) **Scaffold** the graft with RFdiffusion3, holding the epitope and core fixed and setting adaptor length via the contig. (2) **Design** sequence with ProteinMPNN, pinning the ★ contacts and omitting cysteine so no new thiols are introduced. (3) **Co-fold** the complex with Boltz-2 / AlphaFold3 / RF3, reading fold fidelity (Cα RMSD to the design) and interface confidence. (4) **Check geometry** with SOCKET2 (KIH on the excised coil) and DSSP (junction continuity). (5) **Rank and triage**, joining fold and geometry scores and re-verifying the epitope, to yield a short orderable set. Stages run as fan-out HTCondor DAGs.
 
 ---
 
-## The pipeline — design → fold → filter, at pool scale
+## 3. Interpreting predictor scores
 
-The point of the tooling is triage: turn a large diffusion pool into a short, defensible order list. Stages run as reproducible **HTCondor DAGs** (fan-out scaffold → sequences → folds, checkpointed per stage), so a campaign of tens of thousands of designs is bookkeeping rather than heroics.
+The most consequential component of this work is not a model but the discipline of not trusting one uncritically. Several confidence metrics are misleading in specific, learnable ways for this class of interface; each was caught by an explicit control (**Figure 4**).
 
-```mermaid
-flowchart LR
-    A["1 · Scaffold the graft<br/><i>RFdiffusion3</i><br/>epitope + core fixed"]
-    B["2 · Design sequence<br/><i>ProteinMPNN</i><br/>pin ★ contacts, omit Cys"]
-    C["3 · Co-fold complex<br/><i>Boltz-2 / AF3 / RF3</i><br/>fold fidelity + interface"]
-    D["4 · Check geometry<br/><i>SOCKET2 + DSSP</i><br/>KIH + junction continuity"]
-    E["5 · Rank & triage<br/><i>custom harvesters</i><br/>shortlist, re-verify epitope"]
-    A --> B --> C --> D --> E
-```
+- **The interface confidence score (ipTM) is uninformative for this system — even on the native complex.** Folding the wild-type complex as a control, a validated predictor scored the *native* assembly at the same low ipTM as the designs. The low value reflects the predictor's calibration on this interface type, not design failure. This control is what justified ranking designs by an alternative predictor rather than discarding the pool.
+- **Predictors disagree on binding, and the disagreement is itself informative.** Where one predictor favoured the monomer fold but predictors split on receptor engagement, the designs were classified as **"geometry-correct, not validated binders"** — a deliberately weaker claim — rather than promoted. The gate is cross-predictor agreement, not any single ipTM.
+- **A plausible metric can be quietly wrong.** The initial junction-quality metric accepted collinear-but-distorted welds and disagreed with DSSP on most designs, and was retired. A score that cannot be reconciled against structure should not be shipped.
+- **In silico is not in vitro.** Continuity, KIH, ipTM, and RMSD narrow the pool; they do not establish expression, stability, or binding. The design is constructed to hand off to a wet-lab readout — surface display with a labelled receptor — that reports *folded and functional* in a single gate.
 
----
+<p align="center">
+  <img src="figures/figure4_score_interpretation.png" alt="Figure 4 — placeholder" width="720">
+</p>
 
-## Reading the scores with scepticism
-
-The most useful thing here isn't a model — it's the discipline to not believe one. Concrete places a score would have misled me, and the control that caught it:
-
-- **The interface score was uninformative for this system — even on the real thing.** Folding the wild-type complex as a control, a validated predictor scored the _native_ complex at the same low interface confidence (ipTM) as the designs. The number wasn't reporting failure; it just doesn't discriminate for this target. That control is what justified trusting a different predictor's ranking instead of discarding good designs.
-- **Predictors disagree on binding, and the disagreement is data.** When one folder liked the monomer fold but folders split on receptor engagement, those designs were labelled **"geometry-correct, not validated binders"** — a distinct, weaker claim — rather than promoted. Cross-folder agreement, not a single ipTM, is the gate.
-- **A plausible metric can be quietly wrong.** The first junction-quality metric passed welds that were collinear but internally distorted; it disagreed with DSSP on the majority of designs, so it was retired. A score you can't reconcile against structure is a score you shouldn't ship.
-- **In silico ≠ real.** Continuity, KIH, ipTM, RMSD narrow the pool; they don't confirm expression, stability, or binding. The whole design is built to hand off to a wet-lab readout — surface display + labelled-receptor sorting — that reports **folded and functional in one gate**.
+> **Figure 4 | Confidence metrics require target-specific controls.** *(Placeholder — to be added.)* (a) Interface confidence (ipTM) of the wild-type complex versus designs under a validated predictor: the native complex scores as low as the designs, showing the metric does not discriminate for this interface. (b) Cross-predictor disagreement on receptor engagement, used to separate "geometry-correct" designs from validated binders. (c) Deprecated crossing-angle metric versus DSSP junction calls, motivating the switch to a structure-reconciled continuity measure.
 
 ---
 
-## Tooling built along the way
+## 4. Discussion
 
-| Tool | What it does |
+Replacing a native disulfide with a de novo coiled coil reframes a manufacturing constraint as a design problem. Rather than engineering an oxidising environment or accepting low cytoplasmic yield, the fold is re-derived so that its stability no longer depends on chemistry the host cannot perform. The approach generalises beyond this POI: many compact, disulfide-stabilised helical proteins present the same expression barrier, and the same substitution — a well-characterised, register-standardised coiled coil in place of a covalent staple, with role-preserving cysteine cleanup — should transfer, provided the receptor epitope is held fixed and the graft junction is designed and *verified* rather than assumed.
+
+The central open question — rigid versus flexible junction — is left to experiment by design. The same is true of the ultimate readout: every computational filter here is a hypothesis-narrowing step, and the pipeline's value is realised only when its shortlist meets a wet-lab assay. The engineering is therefore built for that hand-off: reproducible, auditable, and explicit about the difference between a design that is geometrically correct and one that is experimentally validated.
+
+---
+
+## 5. Methods
+
+**Backbone generation.** Graft backbones were produced by motif-scaffolding with **RFdiffusion3**, holding the POI core and receptor epitope fixed and setting adaptor length through the diffusion contig.
+
+**Sequence design.** Sequences were designed with **ProteinMPNN**, pinning the receptor-contact (★) positions and omitting cysteine to prevent introduction of new free thiols. **HyperMPNN** (thermostable-retrained weights) was evaluated as a parallel design arm; because *hyperstable* and *hypersoluble* objectives pull in opposite directions on surface composition, arm selection was left to downstream ranking rather than fixed a priori.
+
+**Structure prediction / co-folding.** Complexes were co-folded with **Boltz-2**, **AlphaFold3**, and **RF3**, scoring fold fidelity as Cα RMSD to the design model and interface quality by predictor confidence (ipTM/PAE), with wild-type controls to calibrate metric behaviour.
+
+**Coiled-coil geometry.** Knobs-into-holes packing was assessed with **SOCKET2** (with **DSSP**-derived secondary structure), run on the two graft helices excised into an isolated two-chain model to attribute the KIH call to the graft. Junction continuity was scored with DSSP.
+
+**Compute.** All stages were orchestrated as fan-out, per-stage-checkpointed **HTCondor** DAGs, smoke-tested on a single pose before scale-out.
+
+**Table 2 | Software.**
+
+| Purpose | Tool |
 |---|---|
-| **Fan-out DAGs on HTCondor** | Scaffold → 2 sequences → fold → score, checkpointed per stage, unique per-chunk outputs (the scheduler overwrites same-name transfers), smoke-tested on one pose before spending on tens of thousands. |
-| **Fast CIF parser** | The stock MMCIF parser took ~10 s/structure (hours across a campaign); a hand-rolled `_atom_site` reader with a label/auth-numbering fallback cut it to seconds with no silent misalignment. |
-| **SOCKET2 for arm64** | Ported the knobs-into-holes analyser to run locally on Apple silicon, wired to `mkdssp`, wrapped for batch use with the excise-to-two-chains step built in. |
-| **HyperMPNN as a drop-in arm** | Added thermostable-retrained MPNN weights as a parallel design arm — with the caveat that _hyperstable_ and _hypersoluble_ pull opposite ways on the surface, so ranking decides rather than dogma. |
+| Backbone / motif scaffolding | RFdiffusion3 |
+| Sequence design | ProteinMPNN; HyperMPNN (parallel arm) |
+| Co-folding / structure prediction | Boltz-2, AlphaFold3, RF3 |
+| Coiled-coil (KIH) analysis | SOCKET2 |
+| Secondary-structure assignment | DSSP (`mkdssp`) |
+| Orchestration | HTCondor DAGMan |
+
+**Custom tooling developed for this project.** (i) A fast mmCIF reader (hand-rolled `_atom_site` parser with label/auth-numbering fallback) reducing per-structure parse time from ~10 s to seconds across a campaign; (ii) an **arm64 build of SOCKET2** with a batch wrapper incorporating the excise-to-two-chains step; (iii) DAG generators producing checkpointed, uniquely-named per-chunk outputs to avoid transfer-back collisions on the scheduler.
 
 ---
 
-## Skills demonstrated
+## 6. Data and code availability
 
-- End-to-end use of modern **open-source design methods** (RFdiffusion3, ProteinMPNN) and **structure predictors** (Boltz-2, AlphaFold3, RF3) on a real receptor-binding target.
-- Building **triage tooling** — structure prediction, geometry checks, ranking — that cuts a large design pool to a short synthesis list.
-- **Scepticism beyond in-silico metrics**: wild-type controls, cross-predictor agreement, retiring a bad metric — scores treated as evidence to interrogate, and designs built to hand off cleanly to a wet-lab readout.
-- **Reproducible compute**: parameterised HTCondor DAGs, checkpointing, and QC pipelines that scale to tens of thousands of designs.
+Design reasoning, method descriptions, and tooling are documented in this repository. Consistent with the intellectual-property notice above, designed sequences, coordinate files, expression and assay data, screening yields, and library composition are **not** disclosed. The methods described here are built on publicly available software and on public structural and mutagenesis data for the POI.
 
 ---
 
-## Repository layout
+## References
 
-> _To be populated when the public repo is set up. Suggested structure:_
-
-```
-.
-├── README.md                # this file
-├── pipeline/                # RFd3 → MPNN → fold DAG generators + run scripts
-├── geometry/                # SOCKET2 (KIH) + DSSP continuity analysis
-├── scoring/                 # fold harvesters, cross-predictor ranking, triage
-├── tools/                   # fast CIF parser, SOCKET2 arm64 build, helpers
-└── figures/                 # schematics (no proprietary structures)
-```
+1. Dauparas J. *et al.* Robust deep-learning–based protein sequence design (ProteinMPNN). *Science* (2022).
+2. Watson J.L. *et al.* De novo design of protein structure and function with RFdiffusion. *Nature* (2023).
+3. Abramson J. *et al.* Accurate structure prediction of biomolecular interactions with AlphaFold3. *Nature* (2024).
+4. Wohlwend J. *et al.* Boltz: democratizing biomolecular interaction modeling (Boltz-2). (2025).
+5. Walshaw J. & Woolfson D.N. SOCKET: a program for identifying knobs-into-holes packing in coiled coils. *J. Mol. Biol.* (2001); SOCKET2 update, *Protein Sci.* (2021).
+6. Kabsch W. & Sander C. Dictionary of protein secondary structure (DSSP). *Biopolymers* (1983).
+7. Ertelt M. *et al.* HyperMPNN: generating thermostable proteins with ProteinMPNN. *bioRxiv* (2024).
 
 ---
 
-_By **Jack Archer** · University of Wisconsin–Madison · 2026._
-_Built on public methods and public structural/mutagenesis data for the POI. No proprietary sequences, structures, yields, or library designs are included._
+*By **Jack Archer** · University of Wisconsin–Madison · 2026.*
+*Built on public methods and public structural/mutagenesis data for the POI. No proprietary sequences, structures, yields, or library designs are included. Figures are placeholders pending publication-quality replacements.*
